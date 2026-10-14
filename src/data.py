@@ -129,3 +129,54 @@ def load_shards(feature_dir: str | Path) -> ShardDataset:
         layer_ids=layer_ids or [0],
         metas=metas,
     )
+
+
+def extract_episodes(
+    dataset: ShardDataset,
+    target_layers: Optional[list[int]] = None,
+) -> list[dict[str, Any]]:
+    """
+    Parses a ShardDataset into a list of structured episode objects:
+      ep = {
+          "ep_id": str,
+          "task_idx": int,
+          "rollout_k": int,
+          "success": int,
+          "rounds": {
+              round_idx: {
+                  anchor_name: { layer_id: np.ndarray }
+              }
+          }
+      }
+    """
+    if target_layers is not None:
+        layer_dict = {l: dataset.layer_ids.index(l) for l in target_layers if l in dataset.layer_ids}
+        if not layer_dict:
+            layer_dict = {dataset.layer_ids[0]: 0}
+    else:
+        layer_dict = {l: i for i, l in enumerate(dataset.layer_ids)}
+
+    episodes: dict[str, dict[str, Any]] = {}
+    for i, m in enumerate(dataset.metas):
+        ep_id = m.get("episode_id", f"{m.get('task_idx', 0)}_{m.get('rollout_k', 0)}")
+        r = int(m.get("round", m.get("step_idx", 0)))
+        anc = str(m.get("anchor", "post_gen"))
+
+        if ep_id not in episodes:
+            episodes[ep_id] = {
+                "ep_id": ep_id,
+                "task_idx": int(m.get("task_idx", 0)),
+                "rollout_k": int(m.get("rollout_k", 0)),
+                "success": int(m.get("success", 0)),
+                "rounds": {},
+            }
+
+        if r not in episodes[ep_id]["rounds"]:
+            episodes[ep_id]["rounds"][r] = {}
+
+        episodes[ep_id]["rounds"][r][anc] = {
+            layer_id: dataset.X[i, l_idx, :].astype(np.float32)
+            for layer_id, l_idx in layer_dict.items()
+        }
+
+    return list(episodes.values())

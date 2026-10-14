@@ -2,19 +2,18 @@
 """
 Standard Activation Probe Trainer:
 Trains a standard linear / logistic regression probe on LLM residual stream activations.
-Evaluates binary classification metrics (ROC-AUC, Accuracy, F1, Balanced Accuracy) via Stratified K-Fold.
+Evaluates binary classification metrics (ROC-AUC, Accuracy, F1, Balanced Accuracy) via 5-Fold CV.
 """
 
 import argparse
 from pathlib import Path
 import sys
-import numpy as np
 
 # Ensure repository root is in Python path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.data import load_shards
-from src.standard_probe import StandardActivationProbe
+from src.data import extract_episodes, load_shards
+from src.standard_probe import StandardProbe
 
 
 def parse_args():
@@ -26,13 +25,6 @@ def parse_args():
         help="Directory containing feat.shard*.npz and meta.shard*.jsonl files",
     )
     parser.add_argument(
-        "--classifier",
-        type=str,
-        default="logistic",
-        choices=["logistic", "ridge", "mlp"],
-        help="Classifier type (default: logistic)",
-    )
-    parser.add_argument(
         "--C",
         type=float,
         default=1.0,
@@ -42,19 +34,13 @@ def parse_args():
         "--anchor",
         type=str,
         default="post_gen",
-        help="Anchor position to train probe on (default: post_gen; e.g. pre_gen, first_gen, mean_gen)",
-    )
-    parser.add_argument(
-        "--round",
-        type=int,
-        default=None,
-        help="Filter to a specific round index t (default: None = all rounds pooled)",
+        help="Anchor position to train probe on (default: post_gen)",
     )
     parser.add_argument(
         "--layer",
         type=int,
-        default=None,
-        help="Specific layer index to probe (default: None = first/only layer)",
+        default=20,
+        help="Specific layer index to probe (default: 20)",
     )
     parser.add_argument(
         "--n_splits",
@@ -67,34 +53,28 @@ def parse_args():
 
 def main():
     args = parse_args()
+    data_path = Path(args.data_dir)
+    feat_path = data_path / "features" if (data_path / "features").exists() else data_path
+
     print("=" * 60)
     print("Standard Activation Probe Training")
     print("=" * 60)
-    print(f"Data Directory:   {args.data_dir}")
-    print(f"Classifier:       {args.classifier.upper()} (C={args.C})")
+    print(f"Data Directory:   {data_path}")
     print(f"Anchor:           {args.anchor}")
-    print(f"Round Filter:     {args.round if args.round is not None else 'All Rounds'}")
-    print(f"Layer:            {args.layer if args.layer is not None else 'Default'}")
+    print(f"Layer:            {args.layer}")
+    print(f"C:                {args.C}")
     print("=" * 60)
 
-    # 1. Load Shard Dataset
+    # 1. Load Shards & Extract Episodes
     print("\n[1/2] Loading activation shards...")
-    dataset = load_shards(args.data_dir)
-    print(f"  -> Loaded {dataset.num_samples} total turn records.")
-    print(f"  -> Hidden Dimension: {dataset.hidden_dim}, Layers: {dataset.layer_ids}")
+    dataset = load_shards(feat_path)
+    episodes = extract_episodes(dataset, target_layers=[args.layer])
+    print(f"  -> Loaded {len(episodes)} episodes across {dataset.hidden_dim} dimensions.")
 
-    # 2. Extract 2D Slice
-    X, y, groups = dataset.get_slice(
-        anchor=args.anchor,
-        round_idx=args.round,
-        layer_idx=args.layer,
-    )
-    print(f"  -> Sliced matrix X shape: {X.shape} (Positives: {np.sum(y == 1)}, Negatives: {np.sum(y == 0)})")
-
-    # 3. Fit & Cross-Validate Probe
-    print(f"\n[2/2] Training {args.classifier} probe ({args.n_splits}-Fold Stratified CV)...")
-    probe = StandardActivationProbe(classifier_type=args.classifier, C=args.C)
-    metrics, oof_scores = probe.evaluate_cv(X, y, n_splits=args.n_splits)
+    # 2. Train and Evaluate CV
+    print(f"\n[2/2] Training StandardProbe ({args.n_splits}-Fold CV)...")
+    probe = StandardProbe(layer=args.layer, anchor=args.anchor, C=args.C)
+    metrics, cv_auc = probe.evaluate_cv(episodes, n_splits=args.n_splits)
 
     print("\n" + "=" * 60)
     print("PROBE EVALUATION RESULTS")

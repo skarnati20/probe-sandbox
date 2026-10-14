@@ -1,132 +1,137 @@
+"""
+1. Standard Activation Probe:
+Single-hyperplane linear / logistic probe trained on static residual stream activations (h_t^post).
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression, RidgeClassifier
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
-from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-
-@dataclass
-class StandardProbeMetrics:
-    roc_auc: float
-    accuracy: float
-    balanced_accuracy: float
-    precision: float
-    recall: float
-    f1: float
-    num_samples: int
-    positive_class_ratio: float
+from .base import (
+    BaseProbe,
+    CascadeMetrics,
+    ProbeMetrics,
+    evaluate_abort_policy,
+    evaluate_binary_metrics,
+)
 
 
-class StandardActivationProbe:
+class StandardProbe(BaseProbe):
     """
-    Standard linear / MLP probe trained on LLM residual stream activations.
-    Evaluates whether internal hidden states linearly encode episode success vs failure.
+    Standard static activation probe.
+    Fits a global linear decision hyperplane across static hidden states h_t.
     """
 
     def __init__(
         self,
-        classifier_type: str = "logistic",
+        layer: int = 20,
+        anchor: str = "post_gen",
         C: float = 1.0,
         random_state: int = 42,
     ):
-        self.classifier_type = classifier_type.lower()
-        self.C = C
-        self.random_state = random_state
-        self.pipeline = self._build_pipeline()
+        super().__init__(name="Standard Probe", C=C, random_state=random_state)
+        self.layer = layer
+        self.anchor = anchor
+        self.pipeline = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(C=self.C, max_iter=2000, random_state=self.random_state),
+        )
+        self.threshold: float = 0.5
 
-    def _build_pipeline(self):
-        if self.classifier_type == "logistic":
-            clf = LogisticRegression(
-                C=self.C,
-                max_iter=2000,
-                random_state=self.random_state,
-            )
-        elif self.classifier_type == "ridge":
-            clf = RidgeClassifier(
-                alpha=1.0 / self.C,
-                random_state=self.random_state,
-            )
-        elif self.classifier_type == "mlp":
-            clf = MLPClassifier(
-                hidden_layer_sizes=(256,),
-                alpha=1e-3,
-                max_iter=500,
-                early_stopping=True,
-                random_state=self.random_state,
-            )
-        else:
-            raise ValueError(f"Unknown classifier type: {self.classifier_type}")
+    def extract_features(
+        self,
+        episodes: list[dict[str, Any]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        X_list, y_list = [], []
+        for ep in episodes:
+            for r_data in ep["rounds"].values():
+                if self.anchor in r_data and self.layer in r_data[self.anchor]:
+                    X_list.append(r_data[self.anchor][self.layer])
+                    y_list.append(ep["success"])
 
-        return make_pipeline(StandardScaler(), clf)
+        if not X_list:
+            raise ValueError(f"No features found for anchor='{self.anchor}', layer={self.layer}")
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> StandardActivationProbe:
+        return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=int)
+
+    def fit(self, episodes: list[dict[str, Any]]) -> StandardProbe:
+        X, y = self.extract_features(episodes)
         self.pipeline.fit(X, y)
+
+        # Compute default recall threshold for cascade simulation
+        succ_scores = []
+        for ep in episodes:
+            if ep["success"] == 1:
+                for r_data in ep["rounds"].values():
+                    if self.anchor in r_data and self.layer in r_data[self.anchor]:
+                        vec = r_data[self.anchor][self.layer].reshape(1, -1)
+                        prob = float(self.pipeline.predict_proba(vec)[0, 1])
+                        succ_scores.append(prob)
+
+        if succ_scores:
+            self.threshold = float(np.percentile(succ_scores, 5.0))  # default 95% recall threshold
+        else:
+            self.threshold = 0.5
+
         return self
 
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        if hasattr(self.pipeline.named_steps[self.pipeline.steps[-1][0]], "predict_proba"):
-            return self.pipeline.predict_proba(X)[:, 1]
-        elif hasattr(self.pipeline, "decision_function"):
-            df = self.pipeline.decision_function(X)
-            return 1.0 / (1.0 + np.exp(-df))
-        return self.pipeline.predict(X).astype(float)
+    def score_step(self, episode: dict[str, Any], round_idx: int) -> Optional[float]:
+        rounds = episode.get("rounds", {})
+        if round_idx in rounds and self.anchor in rounds[round_idx]:
+            layer_dict = rounds[round_idx][self.anchor]
+            if self.layer in layer_dict:
+                vec = layer_dict[self.layer].reshape(1, -1)
+                return float(self.pipeline.predict_proba(vec)[0, 1])
+        return None
 
-    def predict(self, X: np.ndarray, threshold: float = 0.5) -> np.ndarray:
-        scores = self.predict_proba(X)
-        return (scores >= threshold).astype(int)
+    def evaluate_classification(self, episodes: list[dict[str, Any]]) -> ProbeMetrics:
+        X, y = self.extract_features(episodes)
+        probs = self.pipeline.predict_proba(X)[:, 1]
+        return evaluate_binary_metrics(y, probs)
+
+    def evaluate_cascade(
+        self,
+        episodes: list[dict[str, Any]],
+        target_recall: float = 0.95,
+    ) -> CascadeMetrics:
+        # Calibrate threshold to target_recall
+        return evaluate_abort_policy(
+            episodes,
+            score_fn=self.score_step,
+            threshold_fn=lambda r: self.threshold,
+            target_recall=target_recall,
+        )
 
     def evaluate_cv(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
+        episodes: list[dict[str, Any]],
         n_splits: int = 5,
-    ) -> tuple[StandardProbeMetrics, np.ndarray]:
-        """
-        Runs Stratified K-Fold Cross-Validation and computes out-of-fold metrics.
-        """
+    ) -> tuple[ProbeMetrics, float]:
+        """Runs Stratified K-Fold CV across episodes."""
+        y_ep = np.array([ep["success"] for ep in episodes])
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
-        oof_preds = np.zeros(len(y), dtype=float)
 
-        for train_idx, val_idx in skf.split(X, y):
-            fold_pipe = self._build_pipeline()
-            fold_pipe.fit(X[train_idx], y[train_idx])
+        all_y_true = []
+        all_y_prob = []
 
-            if hasattr(fold_pipe.named_steps[fold_pipe.steps[-1][0]], "predict_proba"):
-                oof_preds[val_idx] = fold_pipe.predict_proba(X[val_idx])[:, 1]
-            else:
-                df = fold_pipe.decision_function(X[val_idx])
-                oof_preds[val_idx] = 1.0 / (1.0 + np.exp(-df))
+        for train_idx, val_idx in skf.split(episodes, y_ep):
+            train_eps = [episodes[i] for i in train_idx]
+            val_eps = [episodes[i] for i in val_idx]
 
-        # Check for binary variety
-        if len(np.unique(y)) > 1:
-            auc = float(roc_auc_score(y, oof_preds))
-        else:
-            auc = 0.5
+            fold_probe = StandardProbe(layer=self.layer, anchor=self.anchor, C=self.C, random_state=self.random_state)
+            fold_probe.fit(train_eps)
 
-        binary_preds = (oof_preds >= 0.5).astype(int)
-        metrics = StandardProbeMetrics(
-            roc_auc=auc,
-            accuracy=float(accuracy_score(y, binary_preds)),
-            balanced_accuracy=float(balanced_accuracy_score(y, binary_preds)),
-            precision=float(precision_score(y, binary_preds, zero_division=0)),
-            recall=float(recall_score(y, binary_preds, zero_division=0)),
-            f1=float(f1_score(y, binary_preds, zero_division=0)),
-            num_samples=len(y),
-            positive_class_ratio=float(np.mean(y)),
-        )
+            X_val, y_val = fold_probe.extract_features(val_eps)
+            probs = fold_probe.pipeline.predict_proba(X_val)[:, 1]
 
-        return metrics, oof_preds
+            all_y_true.extend(y_val)
+            all_y_prob.extend(probs)
+
+        metrics = evaluate_binary_metrics(np.array(all_y_true), np.array(all_y_prob))
+        return metrics, metrics.roc_auc
